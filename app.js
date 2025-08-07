@@ -10,7 +10,7 @@ class QGCPlanGenerator {
     this.pathLayer = null;
     this.homeLayer = null;
     this.vectorSource = null;
-
+    this.keepTurnWaypoints = false;
     this.init();
   }
 
@@ -216,6 +216,22 @@ class QGCPlanGenerator {
       }
     });
 
+    document
+      .getElementById("pattern-type")
+      .addEventListener("change", (e) => {
+        const show = e.target.value === "survey";
+        document.getElementById("turn-waypoints-group").style.display = show
+          ? "block"
+          : "none";
+        this.onConfigChange();
+      });
+
+      document
+      .getElementById("turn-waypoints-only")
+      .addEventListener("change", (e) => {
+        this.keepTurnWaypoints = e.target.checked;
+        this.onConfigChange();
+      });
     // Button handlers
     document
       .getElementById("generate-btn")
@@ -569,8 +585,44 @@ class QGCPlanGenerator {
       isEvenRow = !isEvenRow;
     }
 
-    return waypoints;
+    return this.keepTurnWaypoints
+      ? this.filterTurnWaypoints(waypoints)
+      : waypoints;
   }
+
+  filterTurnWaypoints(list) {
+    if (list.length <= 2) return list;
+
+    const keep = [list[0]];
+
+    for (let i = 1; i < list.length - 1; i++) {
+      const prev = list[i - 1];
+      const curr = list[i];
+      const next = list[i + 1];
+
+      // bearing from prev→curr and curr→next
+      const h1 = this.bearing(prev, curr);
+      const h2 = this.bearing(curr, next);
+
+      const delta = Math.abs(h1 - h2);
+      if (delta > 5 && delta < 355) keep.push(curr); // turning point
+    }
+    keep.push(list[list.length - 1]);
+    return keep;
+  }
+
+  // basic bearing (degrees) between two lat/lon points (flat enough for grids)
+  bearing(a, b) {
+    const toRad = (deg) => (deg * Math.PI) / 180;
+    const y = Math.sin(toRad(b.lng - a.lng)) * Math.cos(toRad(b.lat));
+    const x =
+      Math.cos(toRad(a.lat)) * Math.sin(toRad(b.lat)) -
+      Math.sin(toRad(a.lat)) *
+        Math.cos(toRad(b.lat)) *
+        Math.cos(toRad(b.lng - a.lng));
+    return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+  }
+
 
   rotatePoint(x, y, cx, cy, angle) {
     const cos = Math.cos(angle);
@@ -966,7 +1018,6 @@ document.addEventListener("readystatechange", () => {
       // Hide loading overlay in case of initialization error
     } finally {
       const overlay = document.getElementById("loading-overlay");
-      console.log(overlay);
       if (overlay) {
         overlay.classList = 'hidden'
       }
