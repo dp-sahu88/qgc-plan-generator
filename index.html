@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QGC Plan Generator</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@v10.6.1/ol.css">
+    <link rel="stylesheet" href="https://unpkg.com/prismjs@1.29.0/themes/prism.min.css" />
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="container">
+                <h1>QGroundControl Plan Generator</h1>
+                <p>Generate QGC mission plans from GeoJSON boundaries using OpenLayers</p>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Left Panel - Configuration -->
+            <div class="panel panel-left">
+                <div class="panel-header">
+                    <h2>Configuration</h2>
+                </div>
+                <div class="panel-body">
+                    <!-- File Upload Section -->
+                    <div class="section">
+                        <h3>GeoJSON Upload</h3>
+                        
+                        <!-- GeoJSON Upload -->
+                        <div class="form-group">
+                            <label class="form-label">GeoJSON Boundary File</label>
+                            <div class="upload-area" id="geojson-upload">
+                                <div class="upload-content">
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                        <polyline points="7,10 12,15 17,10"></polyline>
+                                        <line x1="12" y1="15" x2="12" y2="3"></line>
+                                    </svg>
+                                    <p>Drop GeoJSON file here or click to select</p>
+                                </div>
+                                <input type="file" id="geojson-input" accept=".geojson,.json" hidden>
+                            </div>
+                            <div class="file-info" id="geojson-info"></div>
+                        </div>
+                    </div>
+
+                    <!-- Vehicle Configuration -->
+                    <div class="section">
+                        <h3>Vehicle Configuration</h3>
+                        
+                        <div class="form-group">
+                            <label class="form-label" for="vehicle-type">Vehicle Type</label>
+                            <select id="vehicle-type" class="form-control">
+                                <option value="2">Multi-Rotor</option>
+                                <option value="1">Fixed Wing</option>
+                                <option value="10">Ground Vehicle</option>
+                                <option value="19">VTOL</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="firmware-type">Firmware Type</label>
+                            <select id="firmware-type" class="form-control">
+                                <option value="12">PX4</option>
+                                <option value="3">ArduPilot</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="default-altitude">Default Altitude (m)</label>
+                            <input type="number" id="default-altitude" class="form-control" value="50" min="1" max="1000">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="cruise-speed">Cruise Speed (m/s)</label>
+                            <input type="number" id="cruise-speed" class="form-control" value="15" min="1" max="50" step="0.1">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="hover-speed">Hover Speed (m/s)</label>
+                            <input type="number" id="hover-speed" class="form-control" value="5" min="1" max="25" step="0.1">
+                        </div>
+                    </div>
+
+                    <!-- Mission Pattern -->
+                    <div class="section">
+                        <h3>Mission Pattern</h3>
+                        
+                        <div class="form-group">
+                            <label class="form-label" for="pattern-type">Pattern Type</label>
+                            <select id="pattern-type" class="form-control">
+                                <option value="survey">Survey Grid</option>
+                                <option value="perimeter">Perimeter</option>
+                                <option value="vertices">Vertices</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="waypoint-spacing">Waypoint Spacing (m)</label>
+                            <input type="number" id="waypoint-spacing" class="form-control" value="20" min="5" max="500">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="altitude-mode">Altitude Mode</label>
+                            <select id="altitude-mode" class="form-control">
+                                <option value="0">Relative to Home</option>
+                                <option value="1">Absolute (MSL)</option>
+                                <option value="2">Above Terrain</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Advanced Options -->
+                    <div class="section">
+                        <details class="advanced-options">
+                            <summary>Advanced Options</summary>
+                            <div class="advanced-content">
+                                <div class="form-group">
+                                    <label class="form-label" for="turn-around-distance">Turn Around Distance (m)</label>
+                                    <input type="number" id="turn-around-distance" class="form-control" value="10" min="1" max="100">
+                                </div>
+
+                                <div class="form-group">
+                                    <label class="form-label">
+                                        <input type="checkbox" id="camera-trigger" class="form-control-checkbox">
+                                        Camera Trigger
+                                    </label>
+                                </div>
+
+                                <div class="form-group">
+                                    <label class="form-label" for="grid-angle">Grid Angle (degrees)</label>
+                                    <input type="number" id="grid-angle" class="form-control" value="0" min="-180" max="180">
+                                </div>
+
+                                <div class="form-group">
+                                    <label class="form-label" for="overlap-percentage">Overlap Percentage</label>
+                                    <input type="number" id="overlap-percentage" class="form-control" value="60" min="0" max="100">
+                                </div>
+                            </div>
+                        </details>
+                    </div>
+
+                    <!-- Generate Button -->
+                    <div class="section">
+                        <button id="generate-btn" class="btn btn--primary btn--full-width" disabled>
+                            Generate Mission Plan
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Center Panel - Map -->
+            <div class="panel panel-center">
+                <div class="panel-header">
+                    <h2>Mission Preview</h2>
+                    <div class="map-controls">
+                        <button id="reset-view" class="btn btn--sm btn--outline">Reset View</button>
+                        <button id="load-sample" class="btn btn--sm btn--secondary">Load Sample</button>
+                    </div>
+                </div>
+                <div class="panel-body">
+                    <div id="map" class="map-container"></div>
+                </div>
+            </div>
+
+            <!-- Right Panel - Output -->
+            <div class="panel panel-right">
+                <div class="panel-header">
+                    <h2>Generated Plan</h2>
+                </div>
+                <div class="panel-body">
+                    <!-- Mission Statistics -->
+                    <div class="section">
+                        <h3>Mission Statistics</h3>
+                        <div class="stats-grid">
+                            <div class="stat-item">
+                                <span class="stat-label">Total Waypoints</span>
+                                <span class="stat-value" id="total-waypoints">0</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">Total Distance</span>
+                                <span class="stat-value" id="total-distance">0 m</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">Est. Flight Time</span>
+                                <span class="stat-value" id="flight-time">0 min</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">Area Coverage</span>
+                                <span class="stat-value" id="area-coverage">0 m²</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Plan Preview -->
+                    <div class="section">
+                        <h3>Plan Preview</h3>
+                        <div class="plan-status" id="plan-status">
+                            <div class="status status--info">No plan generated</div>
+                        </div>
+                        <div class="plan-preview">
+                            <pre><code class="language-json" id="plan-json">{}</code></pre>
+                        </div>
+                    </div>
+
+                    <!-- Download Options -->
+                    <div class="section">
+                        <h3>Export Options</h3>
+                        <div class="export-buttons">
+                            <button id="download-plan" class="btn btn--primary btn--full-width" disabled>
+                                Download QGC Plan (.plan)
+                            </button>
+                            <button id="download-json" class="btn btn--outline btn--full-width" disabled>
+                                Export as JSON
+                            </button>
+                            <button id="export-csv" class="btn btn--outline btn--full-width" disabled>
+                                Export Waypoints CSV
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="loading-overlay hidden">
+        <div class="loading-content">
+            <div class="loading-spinner"></div>
+            <p>Processing mission plan...</p>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/ol@v10.6.1/dist/ol.js"></script>
+    <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+    <script src="https://unpkg.com/prismjs@1.29.0/components/prism-core.min.js"></script>
+    <script src="https://unpkg.com/prismjs@1.29.0/components/prism-json.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
