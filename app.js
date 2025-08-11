@@ -1,1026 +1,1500 @@
-// QGC Plan Generator Application with OpenLayers
-class QGCPlanGenerator {
-  constructor() {
-    this.map = null;
-    this.geoJsonData = null;
-    this.waypoints = [];
-    this.currentPlan = null;
-    this.boundaryLayer = null;
-    this.waypointLayer = null;
-    this.pathLayer = null;
-    this.homeLayer = null;
-    this.vectorSource = null;
-    this.keepTurnWaypoints = false;
-    this.init();
-  }
+      // QGroundControl Plan Generator Application - Fixed Version
+      class QGCPlanGenerator {
+          constructor() {
+              this.map = null;
+              this.boundaryData = null;
+              this.currentPlan = null;
+              this.waypoints = [];
+              this.cameraPoints = [];
+              this.debounceTimeout = null;
+              this.validationErrors = new Set();
+              
+              // MAVLink Commands
+              this.MAV_CMD = {
+                  NAV_WAYPOINT: 16,
+                  NAV_TAKEOFF: 22,
+                  NAV_LAND: 21,
+                  NAV_RTL: 20,
+                  DO_SET_CAM_TRIGG_DIST: 206,
+                  SET_CAMERA_MODE: 530,
+                  DO_DIGICAM_CONTROL: 203
+              };
+              
+              // Application data
+              this.appData = {
+                  "mavlink_commands": {
+                      "NAV_WAYPOINT": 16,
+                      "NAV_TAKEOFF": 22,
+                      "NAV_LAND": 21,
+                      "NAV_RTL": 20,
+                      "DO_SET_CAM_TRIGG_DIST": 206,
+                      "SET_CAMERA_MODE": 530,
+                      "DO_DIGICAM_CONTROL": 203
+                  },
+                  "vehicle_types": {
+                      "2": "Multi-Rotor",
+                      "1": "Fixed Wing", 
+                      "10": "Ground Vehicle",
+                      "19": "VTOL"
+                  },
+                  "firmware_types": {
+                      "12": "PX4",
+                      "3": "ArduPilot"
+                  },
+                  "altitude_modes": {
+                      "1": "Relative to Home",
+                      "2": "Absolute (MSL)",
+                      "3": "Above Terrain"
+                  },
+                  "camera_presets": {
+                      "Custom Camera": {
+                          "imageWidth": 4000,
+                          "imageHeight": 3000,
+                          "sensorWidth": 6.17,
+                          "sensorHeight": 4.55,
+                          "focalLength": 4.5
+                      },
+                      "Sony ILCE-QX1": {
+                          "imageWidth": 5456,
+                          "imageHeight": 3632,
+                          "sensorWidth": 23.2,
+                          "sensorHeight": 15.4,
+                          "focalLength": 16
+                      },
+                      "Manual": {
+                          "imageWidth": 1920,
+                          "imageHeight": 1080,
+                          "sensorWidth": 5.7,
+                          "sensorHeight": 4.3,
+                          "focalLength": 3.5
+                      }
+                  },
+                  "sample_geojson": {
+                      "type": "Feature",
+                      "properties": {"name": "Sample Survey Area"},
+                      "geometry": {
+                          "type": "Polygon",
+                          "coordinates": [[
+                              [-73.9857, 40.7484],
+                              [-73.9837, 40.7484],
+                              [-73.9837, 40.7464],
+                              [-73.9857, 40.7464],
+                              [-73.9857, 40.7484]
+                          ]]
+                      }
+                  }
+              };
+              
+              this.init();
+          }
+          
+          init() {
+              this.initMap();
+              this.bindEvents();
+              this.initCollapsible();
+              this.updatePlanStatus('Ready');
+              this.handlePatternChange(); // Initialize pattern visibility
+              this.validateAllInputs(); // Initial validation
+          }
+          
+          initMap() {
+              this.map = L.map('map').setView([40.7484, -73.9847], 15);
+              
+              L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                  attribution: '© OpenStreetMap contributors'
+              }).addTo(this.map);
+              
+              // Initialize layer groups
+              this.boundaryLayer = L.layerGroup().addTo(this.map);
+              this.waypointLayer = L.layerGroup().addTo(this.map);
+              this.pathLayer = L.layerGroup().addTo(this.map);
+              this.cameraLayer = L.layerGroup().addTo(this.map);
+          }
+          
+          bindEvents() {
+              // File upload events
+              document.getElementById('load-sample').addEventListener('click', () => this.loadSampleData());
+              document.getElementById('upload-geojson').addEventListener('click', () => document.getElementById('geojson-file').click());
+              document.getElementById('geojson-file').addEventListener('change', (e) => this.handleFileUpload(e));
+              
+              // Drop zone events
+              const dropZone = document.getElementById('drop-zone');
+              dropZone.addEventListener('click', () => document.getElementById('geojson-file').click());
+              dropZone.addEventListener('dragover', this.handleDragOver.bind(this));
+              dropZone.addEventListener('drop', this.handleDrop.bind(this));
+              dropZone.addEventListener('dragleave', this.handleDragLeave.bind(this));
+              
+              // Form change events with validation
+              const formInputs = document.querySelectorAll('input, select');
+              formInputs.forEach(input => {
+                  input.addEventListener('change', () => {
+                      this.validateInput(input);
+                      this.debouncedUpdate();
+                  });
+                  input.addEventListener('input', () => {
+                      this.validateInput(input);
+                      this.debouncedUpdate();
+                  });
+              });
+              
+              // Special events
+              document.getElementById('pattern-type').addEventListener('change', this.handlePatternChange.bind(this));
+              document.getElementById('camera-trigger').addEventListener('change', this.handleCameraTriggerChange.bind(this));
+              document.getElementById('camera-name').addEventListener('change', this.handleCameraPresetChange.bind(this));
+              document.getElementById('grid-angle').addEventListener('input', this.updateGridAngleDisplay.bind(this));
+              
+              // Generate and export events
+              document.getElementById('generate-plan').addEventListener('click', () => this.generatePlan());
+              document.getElementById('export-plan').addEventListener('click', () => this.exportPlan());
+              document.getElementById('export-json').addEventListener('click', () => this.exportJSON());
+              document.getElementById('export-csv').addEventListener('click', () => this.exportCSV());
+          }
+          
+          // Enhanced Form Validation
+          validateInput(input) {
+              const value = parseFloat(input.value);
+              const min = parseFloat(input.min);
+              const max = parseFloat(input.max);
+              const errorElement = document.getElementById(`${input.id}-error`);
+              
+              let isValid = true;
+              let errorMessage = '';
+              
+              // Clear previous error state
+              input.classList.remove('error');
+              if (errorElement) {
+                  errorElement.textContent = '';
+              }
+              
+              // Validate based on input type and constraints
+              if (input.type === 'number') {
+                  if (isNaN(value) || value === '') {
+                      isValid = false;
+                      errorMessage = 'Please enter a valid number';
+                  } else if (!isNaN(min) && value < min) {
+                      isValid = false;
+                      errorMessage = `Value must be at least ${min}`;
+                  } else if (!isNaN(max) && value > max) {
+                      isValid = false;
+                      errorMessage = `Value must be no more than ${max}`;
+                  }
+                  
+                  // Special validations
+                  switch (input.id) {
+                      case 'altitude':
+                          if (value <= 0) {
+                              isValid = false;
+                              errorMessage = 'Altitude must be positive';
+                          }
+                          break;
+                      case 'cruise-speed':
+                      case 'hover-speed':
+                          if (value <= 0) {
+                              isValid = false;
+                              errorMessage = 'Speed must be positive';
+                          }
+                          break;
+                      case 'frontal-overlap':
+                      case 'side-overlap':
+                          if (value < 50 || value > 90) {
+                              isValid = false;
+                              errorMessage = 'Overlap must be between 50% and 90%';
+                          }
+                          break;
+                      case 'sensor-width':
+                      case 'sensor-height':
+                      case 'focal-length':
+                          if (value <= 0) {
+                              isValid = false;
+                              errorMessage = 'Value must be positive';
+                          }
+                          break;
+                  }
+              }
+              
+              if (!isValid) {
+                  input.classList.add('error');
+                  if (errorElement) {
+                      errorElement.textContent = errorMessage;
+                  }
+                  this.validationErrors.add(input.id);
+              } else {
+                  this.validationErrors.delete(input.id);
+              }
+              
+              // Update generate button state
+              this.updateGenerateButtonState();
+              
+              return isValid;
+          }
+          
+          validateAllInputs() {
+              const inputs = document.querySelectorAll('input[type="number"]');
+              inputs.forEach(input => this.validateInput(input));
+          }
+          
+          updateGenerateButtonState() {
+              const generateBtn = document.getElementById('generate-plan');
+              const hasErrors = this.validationErrors.size > 0;
+              const hasBoundary = !!this.boundaryData;
+              
+              generateBtn.disabled = hasErrors || !hasBoundary;
+          }
+          
+          initCollapsible() {
+              const toggle = document.getElementById('advanced-toggle');
+              const content = document.getElementById('advanced-options');
+              const icon = toggle.querySelector('.toggle-icon');
+              
+              toggle.addEventListener('click', () => {
+                  const isCollapsed = content.classList.contains('collapsed');
+                  if (isCollapsed) {
+                      content.classList.remove('collapsed');
+                      icon.classList.add('expanded');
+                  } else {
+                      content.classList.add('collapsed');
+                      icon.classList.remove('expanded');
+                  }
+              });
+          }
+          
+          handleDragOver(e) {
+              e.preventDefault();
+              document.getElementById('drop-zone').classList.add('dragover');
+          }
+          
+          handleDragLeave(e) {
+              document.getElementById('drop-zone').classList.remove('dragover');
+          }
+          
+          handleDrop(e) {
+              e.preventDefault();
+              document.getElementById('drop-zone').classList.remove('dragover');
+              
+              const files = e.dataTransfer.files;
+              if (files.length > 0) {
+                  this.processFile(files[0]);
+              }
+          }
+          
+          handleFileUpload(e) {
+              const file = e.target.files[0];
+              if (file) {
+                  this.processFile(file);
+              }
+          }
+          
+          processFile(file) {
+              if (!file.name.toLowerCase().endsWith('.json') && !file.name.toLowerCase().endsWith('.geojson')) {
+                  this.showError('Please select a valid GeoJSON or JSON file');
+                  return;
+              }
+              
+              const reader = new FileReader();
+              reader.onload = (e) => {
+                  try {
+                      const data = JSON.parse(e.target.result);
+                      this.loadBoundaryData(data);
+                  } catch (error) {
+                      this.showError('Invalid JSON file: ' + error.message);
+                      console.error('File parsing error:', error);
+                  }
+              };
+              reader.onerror = () => {
+                  this.showError('Error reading file');
+              };
+              reader.readAsText(file);
+          }
+          
+          loadSampleData() {
+              console.log('Loading sample data...');
+              this.loadBoundaryData(this.appData.sample_geojson);
+          }
+          
+          loadBoundaryData(geojson) {
+              console.log('Loading boundary data:', geojson);
+              if (geojson.type === 'FeatureCollection'&& geojson.features.length > 0) {
+                  geojson = geojson.features[0];
+              }
+              
+              if (!geojson || !geojson.geometry) {
+                  this.showError('Invalid GeoJSON format - missing geometry');
+                  return;
+              }
+              
+              if (geojson.geometry.type !== 'Polygon' && geojson.geometry.type !== 'MultiPolygon') {
+                  this.showError('Only Polygon and MultiPolygon geometries are supported');
+                  return;
+              }
+              
+              // For MultiPolygon, take the first polygon
+              if (geojson.geometry.type === 'MultiPolygon') {
+                  if (geojson.geometry.coordinates.length === 0) {
+                      this.showError('MultiPolygon has no coordinates');
+                      return;
+                  }
+                  // Convert to single polygon
+                  geojson.geometry.type = 'Polygon';
+                  geojson.geometry.coordinates = geojson.geometry.coordinates[0];
+              }
+              
+              // Validate polygon coordinates
+              if (!Array.isArray(geojson.geometry.coordinates) || geojson.geometry.coordinates.length === 0) {
+                  this.showError('Invalid polygon coordinates');
+                  return;
+              }
+              
+              const coords = geojson.geometry.coordinates[0];
+              if (!Array.isArray(coords) || coords.length < 4) {
+                  this.showError('Polygon must have at least 4 coordinate points');
+                  return;
+              }
+              
+              this.boundaryData = geojson;
+              this.displayBoundary();
+              this.updateBoundaryInfo();
+              this.updateGenerateButtonState();
+              this.debouncedUpdate();
+              
+              console.log('Boundary data loaded successfully');
+          }
+          
+          displayBoundary() {
+              this.boundaryLayer.clearLayers();
+              
+              if (this.boundaryData && this.boundaryData.geometry) {
+                  try {
+                      const layer = L.geoJSON(this.boundaryData, {
+                          style: {
+                              color: '#1FB8CD',
+                              weight: 3,
+                              fillColor: '#1FB8CD',
+                              fillOpacity: 0.1
+                          }
+                      }).addTo(this.boundaryLayer);
+                      
+                      this.map.fitBounds(layer.getBounds());
+                  } catch (error) {
+                      this.showError('Error displaying boundary: ' + error.message);
+                  }
+              }
+          }
+          
+          updateBoundaryInfo() {
+              if (this.boundaryData) {
+                  const name = this.boundaryData.properties?.name || 'Loaded Area';
+                  const area = this.calculatePolygonArea(this.boundaryData.geometry.coordinates[0]);
+                  
+                  document.getElementById('boundary-name').textContent = name;
+                  document.getElementById('boundary-area').textContent = Math.round(area).toLocaleString();
+                  document.getElementById('boundary-info').classList.remove('hidden');
+              }
+          }
+          
+          handlePatternChange() {
+              const patternType = document.getElementById('pattern-type').value;
+              const turnWaypointsGroup = document.getElementById('turn-waypoints-group');
+              console.log('Pattern changed to:', patternType);
+              
+              if (patternType === 'survey') {
+                  turnWaypointsGroup.style.display = 'block';
+                  console.log('Showing survey-specific options');
+              } else {
+                  turnWaypointsGroup.style.display = 'none';
+                  document.getElementById('turn-waypoints-only').checked = false;
+                  console.log('Hiding survey-specific options');
+              }
+              
+              this.debouncedUpdate();
+          }
+          
+          handleCameraTriggerChange() {
+              const cameraSettings = document.getElementById('camera-settings');
+              const isEnabled = document.getElementById('camera-trigger').checked;
+              
+              console.log('Camera trigger changed to:', isEnabled);
+              
+              if (isEnabled) {
+                  cameraSettings.style.display = 'block';
+                  cameraSettings.classList.add('fade-in');
+                  console.log('Showing camera settings');
+              } else {
+                  cameraSettings.style.display = 'none';
+                  console.log('Hiding camera settings');
+              }
+              
+              this.debouncedUpdate();
+          }
+          
+          handleCameraPresetChange() {
+              const cameraName = document.getElementById('camera-name').value;
+              const preset = this.appData.camera_presets[cameraName];
+              
+              if (preset) {
+                  document.getElementById('image-width').value = preset.imageWidth;
+                  document.getElementById('image-height').value = preset.imageHeight;
+                  document.getElementById('sensor-width').value = preset.sensorWidth;
+                  document.getElementById('sensor-height').value = preset.sensorHeight;
+                  document.getElementById('focal-length').value = preset.focalLength;
+                  
+                  // Re-validate the updated inputs
+                  ['image-width', 'image-height', 'sensor-width', 'sensor-height', 'focal-length'].forEach(id => {
+                      const input = document.getElementById(id);
+                      this.validateInput(input);
+                  });
+              }
+              
+              this.debouncedUpdate();
+          }
+          
+          updateGridAngleDisplay() {
+              const angle = document.getElementById('grid-angle').value;
+              document.getElementById('grid-angle-value').textContent = `${angle}°`;
+          }
+          
+          debouncedUpdate() {
+              clearTimeout(this.debounceTimeout);
+              this.debounceTimeout = setTimeout(() => {
+                  this.updateVisualization();
+              }, 300);
+          }
+          
+          updateVisualization() {
+              if (!this.boundaryData) {
+                  console.log('No boundary data for visualization');
+                  return;
+              }
+              
+              const patternType = document.getElementById('pattern-type').value;
+              this.clearLayers();
+              
+              console.log('Updating visualization for pattern:', patternType);
+              
+              try {
+                  switch (patternType) {
+                      case 'survey':
+                          this.generateSurveyPattern();
+                          break;
+                      case 'perimeter':
+                          this.generatePerimeterPattern();
+                          break;
+                      case 'vertices':
+                          this.generateVerticesPattern();
+                          break;
+                  }
+                  
+                  this.updateStatistics();
+              } catch (error) {
+                  console.error('Error updating visualization:', error);
+                  this.showError('Error generating pattern: ' + error.message);
+              }
+          }
+          
+          // Fixed Survey Pattern Generation
+          generateSurveyPattern() {
+              const coords = this.boundaryData.geometry.coordinates[0];
+              const altitude = parseFloat(document.getElementById('altitude').value);
+              const gridAngle = parseFloat(document.getElementById('grid-angle').value);
+              const turnAroundDistance = parseFloat(document.getElementById('turn-around-distance').value);
+              const spacing = this.calculateLineSpacing();
 
-  init() {
-    try {
-      // Ensure loading overlay is hidden first
-      this.showLoading(false);
-      this.initMap();
-      this.setupEventListeners();
-    } catch (error) {
-      console.error("Initialization error:", error);
-      this.showLoading(false);
-    }
-  }
+              if (!spacing){
+                  console.log("unable to process line spacing.")
+                  return
+              }
 
-  initMap() {
-    // Initialize OpenLayers map
-    this.vectorSource = new ol.source.Vector();
+              const turnWaypointsOnly = document.getElementById('turn-waypoints-only').checked;
+              
+              console.log('Generating survey pattern with params:', {
+                  altitude, gridAngle, turnAroundDistance, spacing, turnWaypointsOnly
+              });
+              
+              // Calculate survey grid with proper spacing
+              const surveyLines = this.calculateSurveyGrid(coords, gridAngle, spacing, turnAroundDistance);
+              this.waypoints = [];
+              
+              if (surveyLines.length === 0) {
+                  console.warn('No survey lines generated');
+                  return;
+              }
+              
+              // Generate waypoints from survey lines
+              let waypointId = 1;
+              
+              for (let i = 0; i < surveyLines.length; i++) {
+                  const line = surveyLines[i];
+                  
+                  if (turnWaypointsOnly) {
+                      // Only add start and end points of each line
+                      if (line.length > 0) {
+                          this.waypoints.push({
+                              id: waypointId++,
+                              lat: line[0][1],
+                              lng: line[0][0],
+                              alt: altitude,
+                              type: 'survey_start'
+                          });
+                          
+                          if (line.length > 1) {
+                              this.waypoints.push({
+                                  id: waypointId++,
+                                  lat: line[line.length - 1][1],
+                                  lng: line[line.length - 1][0],
+                                  alt: altitude,
+                                  type: 'survey_end'
+                              });
+                          }
+                      }
+                  } else {
+                      // Add waypoints along each line with proper spacing
+                      const lineSpacing = 10; // meters between waypoints on same line
+                      const sampledLine = this.sampleLineString(line, lineSpacing);
+                      
+                      sampledLine.forEach(point => {
+                          this.waypoints.push({
+                              id: waypointId++,
+                              lat: point[1],
+                              lng: point[0],
+                              alt: altitude,
+                              type: 'survey'
+                          });
+                      });
+                  }
+              }
+              
+              console.log(`Generated ${this.waypoints.length} waypoints`);
+              
+              // Generate camera trigger points if enabled
+              if (document.getElementById('camera-trigger').checked) {
+                  this.generateCameraTriggerPoints();
+              }
+              
+              this.displayWaypoints();
+              this.displayFlightPath();
+          }
 
-    const vectorLayer = new ol.layer.Vector({
-      source: this.vectorSource,
-      style: this.getFeatureStyle.bind(this),
-    });
+         calculateLineSpacing() {
+            this.validateAllInputs()
+            if (this.validationErrors.size>0){
+                return
+            }
+            // Fetch values from the DOM
+            const imageWidthElement = document.getElementById('image-width');
+            const imageHeightElement = document.getElementById('image-height');
+            const sensorWidthElement = document.getElementById('sensor-width');
+            const sensorHeightElement = document.getElementById('sensor-height');
+            const focalLengthElement = document.getElementById('focal-length');
+            const frontalOverlapElement = document.getElementById('frontal-overlap');
+            const sideOverlapElement = document.getElementById('side-overlap');
+            const flightAltitude = parseFloat(document.getElementById('altitude').value)
+            // Validate DOM elements
+            if (!imageWidthElement || !imageHeightElement || !sensorWidthElement || !sensorHeightElement || !focalLengthElement || !frontalOverlapElement || !sideOverlapElement) {
+                console.error('One or more required elements are missing from the DOM');
+                return;
+            }
 
-    this.map = new ol.Map({
-      target: "map",
-      layers: [
-        new ol.layer.Tile({
-          source: new ol.source.OSM(),
-        }),
-        vectorLayer,
-      ],
-      view: new ol.View({
-        center: ol.proj.fromLonLat([0, 0]),
-        zoom: 2,
-      }),
-    });
+            // Parse values
+            const imageWidth = parseFloat(imageWidthElement.value);       // px
+            const imageHeight = parseFloat(imageHeightElement.value);     // px
+            const sensorWidth = parseFloat(sensorWidthElement.value);     // mm
+            const sensorHeight = parseFloat(sensorHeightElement.value);   // mm
+            const focalLength = parseFloat(focalLengthElement.value);     // mm
+            const frontalOverlap = parseFloat(frontalOverlapElement.value); // %
+            const sideOverlap = parseFloat(sideOverlapElement.value);       // %
 
-    // Add popup overlay
-    this.setupPopup();
-  }
+            // Validate numbers and ranges
+            if (
+                isNaN(imageWidth) || isNaN(imageHeight) ||
+                isNaN(sensorWidth) || isNaN(sensorHeight) ||
+                isNaN(focalLength) || isNaN(frontalOverlap) || isNaN(sideOverlap)
+            ) {
+                console.error('One or more values are not numeric');
+                return;
+            }
+            if (imageWidth <= 0 || imageHeight <= 0 || sensorWidth <= 0 || sensorHeight <= 0 || focalLength <= 0) {
+                console.error('Image and sensor dimensions, and focal length must be positive');
+                return;
+            }
+            if (frontalOverlap < 0 || frontalOverlap >= 100 || sideOverlap < 0 || sideOverlap >= 100) {
+                console.error('Overlap values must be between 0 (inclusive) and 100 (exclusive)');
+                return;
+            }
+            if (isNaN(flightAltitude) || flightAltitude <= 0) {
+                console.error('Flight altitude must be a positive number');
+                return;
+            }
 
-  setupPopup() {
-    const popup = document.createElement("div");
-    popup.className = "ol-popup";
-    popup.style.cssText = `
-            position: absolute;
-            background: var(--color-surface);
-            border: 1px solid var(--color-border);
-            border-radius: var(--radius-base);
-            padding: var(--space-8);
-            box-shadow: var(--shadow-md);
-            font-size: var(--font-size-sm);
-            max-width: 200px;
-            z-index: 1000;
-        `;
+            // Convert sensor size from mm to meters
+            const sensorWidthM = sensorWidth / 1000;
+            const sensorHeightM = sensorHeight / 1000;
+            const focalLengthM = focalLength / 1000;
 
-    const overlay = new ol.Overlay({
-      element: popup,
-      autoPan: {
-        animation: {
-          duration: 250,
-        },
-      },
-    });
+            // Ground width & height captured per image (meters)
+            const groundWidth = (flightAltitude * sensorWidthM) / focalLengthM;
+            const groundHeight = (flightAltitude * sensorHeightM) / focalLengthM;
 
-    this.map.addOverlay(overlay);
-
-    // Handle click events
-    this.map.on("singleclick", (evt) => {
-      const feature = this.map.forEachFeatureAtPixel(evt.pixel, (feature) => {
-        return feature;
-      });
-
-      if (feature) {
-        const props = feature.get("properties") || {};
-        let content = "";
-
-        if (props.type === "waypoint") {
-          content = `Waypoint ${props.id}<br>Lat: ${props.lat.toFixed(
-            6
-          )}<br>Lng: ${props.lng.toFixed(6)}<br>Alt: ${props.alt}m`;
-        } else if (props.type === "home") {
-          content = `Home Position<br>Lat: ${props.lat.toFixed(
-            6
-          )}<br>Lng: ${props.lng.toFixed(6)}<br>Alt: ${props.alt}m`;
-        } else if (props.type === "boundary") {
-          content = "Mission Boundary";
+            // Calculate effective line spacings
+            // (1 - sideOverlap) or (1 - frontalOverlap) gives the non-overlapped part as fraction
+            const sideSpacing = groundWidth * (1 - sideOverlap / 100);
+            // const frontalSpacing = groundHeight * (1 - frontalOverlap / 100);
+            return sideSpacing
+            // return {
+            //     sideLineSpacingMeters: sideSpacing,
+            //     frontalLineSpacingMeters: frontalSpacing
+            // };
         }
 
-        if (content) {
-          popup.innerHTML = content;
-          overlay.setPosition(evt.coordinate);
-        } else {
-          overlay.setPosition(undefined);
-        }
-      } else {
-        overlay.setPosition(undefined);
+          
+          // Improved survey grid calculation
+          calculateSurveyGrid(coords, angle, spacing, turnAroundDistance) {
+              const bounds = this.getPolygonBounds(coords);
+              const lines = [];
+              
+              // Convert angle to radians
+              const radians = (angle * Math.PI) / 180;
+              const cos = Math.cos(radians);
+              const sin = Math.sin(radians);
+              
+              // Calculate polygon center
+              const centerLat = (bounds.minLat + bounds.maxLat) / 2;
+              const centerLng = (bounds.minLng + bounds.maxLng) / 2;
+              
+              // Extend bounds to ensure full coverage
+              const latRange = bounds.maxLat - bounds.minLat;
+              const lngRange = bounds.maxLng - bounds.minLng;
+              const maxDimension = Math.max(latRange, lngRange);
+              
+              const extendedBounds = {
+                  minLat: centerLat - maxDimension,
+                  maxLat: centerLat + maxDimension,
+                  minLng: centerLng - maxDimension,
+                  maxLng: centerLng + maxDimension
+              };
+              
+              // Convert spacing from meters to degrees (approximation)
+              const spacingDeg = spacing / 111000; // 1 degree ≈ 111km
+              
+              // Generate parallel lines
+              const numLines = Math.ceil((extendedBounds.maxLat - extendedBounds.minLat) / spacingDeg);
+              
+              for (let i = 0; i <= numLines; i++) {
+                  const y = extendedBounds.minLat + (i * spacingDeg);
+                  
+                  // Create line endpoints
+                  const startX = extendedBounds.minLng;
+                  const endX = extendedBounds.maxLng;
+                  
+                  // Rotate line around center
+                  const lineStart = this.rotatePoint([startX, y], [centerLng, centerLat], radians);
+                  const lineEnd = this.rotatePoint([endX, y], [centerLng, centerLat], radians);
+                  
+                  // Find intersections with polygon
+                  const intersections = this.getLinePolygonIntersections([lineStart, lineEnd], coords);
+                  
+                  if (intersections.length >= 2) {
+                      // Sort intersections by distance along line
+                      intersections.sort((a, b) => {
+                          const distA = this.calculateDistance(lineStart[1], lineStart[0], a[1], a[0]);
+                          const distB = this.calculateDistance(lineStart[1], lineStart[0], b[1], b[0]);
+                          return distA - distB;
+                      });
+                      
+                      // Create line segments from intersection pairs
+                      for (let j = 0; j < intersections.length; j += 2) {
+                          if (j + 1 < intersections.length) {
+                              let segmentStart = intersections[j];
+                              let segmentEnd = intersections[j + 1];
+                              
+                              // Reverse every other line for efficient survey pattern
+                              if (i % 2 === 1) {
+                                  [segmentStart, segmentEnd] = [segmentEnd, segmentStart];
+                              }
+                              
+                              lines.push([segmentStart, segmentEnd]);
+                          }
+                      }
+                  }
+              }
+              
+              return lines;
+          }
+          
+          // Helper functions for survey grid calculation
+          rotatePoint(point, center, angle) {
+              const cos = Math.cos(angle);
+              const sin = Math.sin(angle);
+              
+              const dx = point[0] - center[0];
+              const dy = point[1] - center[1];
+              
+              return [
+                  center[0] + dx * cos - dy * sin,
+                  center[1] + dx * sin + dy * cos
+              ];
+          }
+          
+          getLinePolygonIntersections(line, polygon) {
+              const intersections = [];
+              const [lineStart, lineEnd] = line;
+              
+              for (let i = 0; i < polygon.length - 1; i++) {
+                  const segStart = polygon[i];
+                  const segEnd = polygon[i + 1];
+                  
+                  const intersection = this.getLineIntersection(lineStart, lineEnd, segStart, segEnd);
+                  if (intersection) {
+                      intersections.push(intersection);
+                  }
+              }
+              
+              return intersections;
+          }
+          
+          getLineIntersection(line1Start, line1End, line2Start, line2End) {
+              const x1 = line1Start[0], y1 = line1Start[1];
+              const x2 = line1End[0], y2 = line1End[1];
+              const x3 = line2Start[0], y3 = line2Start[1];
+              const x4 = line2End[0], y4 = line2End[1];
+              
+              const denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+              if (Math.abs(denom) < 1e-10) return null; // Lines are parallel
+              
+              const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom;
+              const u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom;
+              
+              if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
+                  return [
+                      x1 + t * (x2 - x1),
+                      y1 + t * (y2 - y1)
+                  ];
+              }
+              
+              return null;
+          }
+          
+          sampleLineString(line, spacingMeters) {
+              if (line.length < 2) return line;
+              
+              const sampledPoints = [line[0]]; // Always include start point
+              let currentDistance = 0;
+              const spacingDeg = spacingMeters / 111000; // Convert to degrees
+              
+              for (let i = 1; i < line.length; i++) {
+                  const segmentLength = this.calculateDistance(line[i-1][1], line[i-1][0], line[i][1], line[i][0]);
+                  
+                  while (currentDistance + spacingDeg < segmentLength) {
+                      currentDistance += spacingDeg;
+                      const ratio = currentDistance / segmentLength;
+                      
+                      const interpolatedPoint = [
+                          line[i-1][0] + (line[i][0] - line[i-1][0]) * ratio,
+                          line[i-1][1] + (line[i][1] - line[i-1][1]) * ratio
+                      ];
+                      
+                      sampledPoints.push(interpolatedPoint);
+                  }
+                  
+                  currentDistance = 0; // Reset for next segment
+              }
+              
+              sampledPoints.push(line[line.length - 1]); // Always include end point
+              return sampledPoints;
+          }
+          
+          generatePerimeterPattern() {
+              const coords = this.boundaryData.geometry.coordinates[0];
+              const altitude = parseFloat(document.getElementById('altitude').value);
+              
+              this.waypoints = coords.slice(0, -1).map((coord, index) => ({
+                  id: index + 1,
+                  lat: coord[1],
+                  lng: coord[0],
+                  alt: altitude,
+                  type: 'perimeter'
+              }));
+              
+              console.log(`Generated ${this.waypoints.length} perimeter waypoints`);
+              
+              this.displayWaypoints();
+              this.displayFlightPath();
+          }
+          
+          generateVerticesPattern() {
+              const coords = this.boundaryData.geometry.coordinates[0];
+              const altitude = parseFloat(document.getElementById('altitude').value);
+              
+              this.waypoints = coords.slice(0, -1).map((coord, index) => ({
+                  id: index + 1,
+                  lat: coord[1],
+                  lng: coord[0],
+                  alt: altitude,
+                  type: 'vertex'
+              }));
+              
+              console.log(`Generated ${this.waypoints.length} vertex waypoints`);
+              
+              this.displayWaypoints();
+          }
+          
+          // Fixed camera trigger point generation
+          generateCameraTriggerPoints() {
+              if (this.waypoints.length < 2) return;
+              
+              const triggerDistance = this.calculateTriggerDistance();
+              if (triggerDistance <= 0) {
+                  console.warn('Invalid trigger distance calculated');
+                  return;
+              }
+              
+              this.cameraPoints = [];
+              let currentDistance = 0;
+              let triggerId = 1;
+              
+              // Add initial trigger point at first waypoint
+              this.cameraPoints.push({
+                  id: triggerId++,
+                  lat: this.waypoints[0].lat,
+                  lng: this.waypoints[0].lng,
+                  alt: this.waypoints[0].alt
+              });
+              
+              for (let i = 1; i < this.waypoints.length; i++) {
+                  const prev = this.waypoints[i - 1];
+                  const curr = this.waypoints[i];
+                  const segmentDistance = this.calculateDistance(prev.lat, prev.lng, curr.lat, curr.lng);
+                  
+                  let distanceAlongSegment = 0;
+                  
+                  while (currentDistance + triggerDistance <= segmentDistance) {
+                      currentDistance += triggerDistance;
+                      distanceAlongSegment = currentDistance;
+                      
+                      if (distanceAlongSegment <= segmentDistance) {
+                          const ratio = distanceAlongSegment / segmentDistance;
+                          
+                          const lat = prev.lat + (curr.lat - prev.lat) * ratio;
+                          const lng = prev.lng + (curr.lng - prev.lng) * ratio;
+                          
+                          this.cameraPoints.push({
+                              id: triggerId++,
+                              lat: lat,
+                              lng: lng,
+                              alt: curr.alt
+                          });
+                      }
+                  }
+                  
+                  currentDistance = segmentDistance - distanceAlongSegment;
+              }
+              
+              console.log(`Generated ${this.cameraPoints.length} camera trigger points`);
+              this.displayCameraTriggers();
+          }
+          
+          // Fixed trigger distance calculation
+          calculateTriggerDistance() {
+              const altitude = parseFloat(document.getElementById('altitude').value);
+              const sensorWidth = parseFloat(document.getElementById('sensor-width').value);
+              const focalLength = parseFloat(document.getElementById('focal-length').value);
+              const frontalOverlap = parseFloat(document.getElementById('frontal-overlap').value) / 100;
+              const minTriggerInterval = parseFloat(document.getElementById('min-trigger-interval').value);
+              const cruiseSpeed = parseFloat(document.getElementById('cruise-speed').value);
+              
+              // Validate inputs
+              if (sensorWidth <= 0 || focalLength <= 0 || altitude <= 0) {
+                  console.warn('Invalid camera parameters for trigger calculation');
+                  return 50; // Default fallback
+              }
+              
+              // Calculate ground sample distance (GSD) in meters per pixel
+              const gsd = (altitude * sensorWidth) / (focalLength * 1000); // Convert mm to m
+              
+              // Calculate image width coverage on ground
+              const imageWidth = parseFloat(document.getElementById('image-width').value);
+              const groundWidth = gsd * imageWidth;
+              
+              // Calculate trigger distance based on overlap
+              const triggerDistance = groundWidth * (1 - frontalOverlap);
+              
+              // Ensure minimum trigger interval is respected
+              const minDistance = cruiseSpeed * minTriggerInterval;
+              
+              return Math.max(triggerDistance, minDistance);
+          }
+          
+          displayWaypoints() {
+              this.waypointLayer.clearLayers();
+              
+              this.waypoints.forEach((waypoint, index) => {
+                  const marker = L.marker([waypoint.lat, waypoint.lng], {
+                      icon: this.createWaypointIcon(waypoint.id)
+                  }).addTo(this.waypointLayer);
+                  
+                  marker.bindPopup(`
+                      <div>
+                          <h4>Waypoint ${waypoint.id}</h4>
+                          <p><strong>Lat:</strong> ${waypoint.lat.toFixed(6)}</p>
+                          <p><strong>Lng:</strong> ${waypoint.lng.toFixed(6)}</p>
+                          <p><strong>Alt:</strong> ${waypoint.alt} m</p>
+                          <p><strong>Type:</strong> ${waypoint.type}</p>
+                      </div>
+                  `);
+              });
+              
+              // Add home position marker
+              if (this.waypoints.length > 0) {
+                  const home = this.waypoints[0];
+                  L.marker([home.lat, home.lng], {
+                      icon: this.createHomeIcon()
+                  }).addTo(this.waypointLayer);
+              }
+          }
+          
+          displayFlightPath() {
+              this.pathLayer.clearLayers();
+              
+              if (this.waypoints.length > 1) {
+                  const path = this.waypoints.map(wp => [wp.lat, wp.lng]);
+                  L.polyline(path, {
+                      color: '#1FB8CD',
+                      weight: 3,
+                      opacity: 0.8
+                  }).addTo(this.pathLayer);
+              }
+          }
+          
+          displayCameraTriggers() {
+              this.cameraLayer.clearLayers();
+              
+              this.cameraPoints.forEach(point => {
+                  L.marker([point.lat, point.lng], {
+                      icon: this.createCameraIcon()
+                  }).addTo(this.cameraLayer);
+              });
+          }
+          
+          createWaypointIcon(number) {
+              return L.divIcon({
+                  className: 'waypoint-marker',
+                  html: `<div style="width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;">${number}</div>`,
+                  iconSize: [24, 24],
+                  iconAnchor: [12, 12]
+              });
+          }
+          
+          createHomeIcon() {
+              return L.divIcon({
+                  className: 'home-marker',
+                  html: '<div style="width: 20px; height: 20px; display: flex; align-items: center; justify-content: center;">H</div>',
+                  iconSize: [20, 20],
+                  iconAnchor: [10, 10]
+              });
+          }
+          
+          createCameraIcon() {
+              return L.divIcon({
+                  className: 'camera-marker',
+                  html: '<div style="width: 16px; height: 16px; display: flex; align-items: center; justify-content: center;">📷</div>',
+                  iconSize: [16, 16],
+                  iconAnchor: [8, 8]
+              });
+          }
+          
+          clearLayers() {
+              this.waypointLayer.clearLayers();
+              this.pathLayer.clearLayers();
+              this.cameraLayer.clearLayers();
+              this.cameraPoints = [];
+          }
+          
+          updateStatistics() {
+              const stats = this.calculateStatistics();
+              
+              document.getElementById('stat-waypoints').textContent = stats.waypoints;
+              document.getElementById('stat-distance').textContent = `${stats.distance} m`;
+              document.getElementById('stat-time').textContent = `${stats.flightTime} min`;
+              document.getElementById('stat-shots').textContent = stats.cameraShots;
+              document.getElementById('stat-area').textContent = `${stats.area} m²`;
+          }
+          
+          calculateStatistics() {
+              const waypoints = this.waypoints.length;
+              const distance = Math.round(this.calculateTotalDistance());
+              const speed = parseFloat(document.getElementById('cruise-speed').value) || 15;
+              const flightTime = Math.round((distance / speed) / 60 * 10) / 10; // Round to 1 decimal
+              const cameraShots = this.cameraPoints.length;
+              const area = this.boundaryData ? Math.round(this.calculatePolygonArea(this.boundaryData.geometry.coordinates[0])) : 0;
+              
+              return {
+                  waypoints,
+                  distance,
+                  flightTime,
+                  cameraShots,
+                  area
+              };
+          }
+          
+          calculateTotalDistance() {
+              let total = 0;
+              for (let i = 1; i < this.waypoints.length; i++) {
+                  const prev = this.waypoints[i - 1];
+                  const curr = this.waypoints[i];
+                  total += this.calculateDistance(prev.lat, prev.lng, curr.lat, curr.lng);
+              }
+              return total;
+          }
+          
+          // Progress tracking for plan generation
+          showProgress(progress) {
+              const progressBar = document.getElementById('progress-bar');
+              const progressFill = document.getElementById('progress-fill');
+              
+              progressBar.classList.remove('hidden');
+              progressFill.style.width = `${progress}%`;
+              
+              if (progress >= 100) {
+                  setTimeout(() => {
+                      progressBar.classList.add('hidden');
+                      progressFill.style.width = '0%';
+                  }, 500);
+              }
+          }
+          
+          async generatePlan() {
+              if (this.validationErrors.size > 0) {
+                  this.showError('Please fix validation errors before generating plan');
+                  return;
+              }
+              
+              if (!this.boundaryData) {
+                  this.showError('Please load boundary data first');
+                  return;
+              }
+              
+              if (this.waypoints.length === 0) {
+                  this.showError('No waypoints generated. Please ensure boundary data is loaded and pattern is configured');
+                  return;
+              }
+              
+              this.showLoading(true);
+              this.updatePlanStatus('Generating...');
+              
+              try {
+                  // Simulate progress
+                  this.showProgress(20);
+                  await this.delay(200);
+                  
+                  this.currentPlan = this.createQGCPlan();
+                  this.showProgress(60);
+                  await this.delay(200);
+                  
+                  this.updatePlanPreview();
+                  this.showProgress(80);
+                  await this.delay(200);
+                  
+                  this.enableExportButtons();
+                  this.updatePlanStatus('Valid');
+                  this.showProgress(100);
+                  
+                  console.log('Plan generated successfully:', this.currentPlan);
+                  
+              } catch (error) {
+                  console.error('Plan generation failed:', error);
+                  this.showError('Plan generation failed: ' + error.message);
+                  this.updatePlanStatus('Error');
+              } finally {
+                  this.showLoading(false);
+              }
+          }
+          
+          delay(ms) {
+              return new Promise(resolve => setTimeout(resolve, ms));
+          }
+          
+          createQGCPlan() {
+              const vehicleType = parseInt(document.getElementById('vehicle-type').value);
+              const firmwareType = parseInt(document.getElementById('firmware-type').value);
+              const cruiseSpeed = parseFloat(document.getElementById('cruise-speed').value) || 15;
+              const hoverSpeed = parseFloat(document.getElementById('hover-speed').value) || 5;
+              
+              if (this.waypoints.length === 0) {
+                  throw new Error('No waypoints available for plan generation');
+              }
+              
+              const home = this.waypoints[0];
+              const plannedHomePosition = [home.lat, home.lng, home.alt];
+              
+              const plan = {
+                  fileType: "Plan",
+                  geoFence: {
+                      circles: [],
+                      polygons: [],
+                      version: 2
+                  },
+                  groundStation: "QGroundControl",
+                  mission: {
+                      cruiseSpeed: cruiseSpeed,
+                      firmwareType: firmwareType,
+                      globalPlanAltitudeMode: parseInt(document.getElementById('altitude-mode').value),
+                      hoverSpeed: hoverSpeed,
+                      items: this.generateMissionItems(),
+                      plannedHomePosition: plannedHomePosition,
+                      vehicleType: vehicleType,
+                      version: 2
+                  },
+                  rallyPoints: {
+                      points: [],
+                      version: 2
+                  },
+                  version: 1
+              };
+              
+              return plan;
+          }
+          
+          generateMissionItems() {
+              const items = [];
+              let sequence = 0;
+              
+              // Validate required parameters
+              const altitude = parseFloat(document.getElementById('altitude').value);
+              const altitudeMode = parseInt(document.getElementById('altitude-mode').value);
+              
+              if (isNaN(altitude) || altitude <= 0) {
+                  throw new Error('Invalid altitude value');
+              }
+              // Calculate centroid of polygon
+              const centroid = this.getPolygonCentroid(this.boundaryData.geometry.coordinates[0]);
+              
+              // Add takeoff command
+              items.push({
+                  AMSLAltAboveTerrain: null,
+                  Altitude: altitude,
+                  AltitudeMode: altitudeMode,
+                  autoContinue: true,
+                  command: this.MAV_CMD.NAV_TAKEOFF,
+                  doJumpId: sequence++,
+                  frame: 3,
+                  params: [0, 0, 0, 0, centroid[0], centroid[1], altitude],
+                  type: "SimpleItem"
+              });
+              
+              // Add camera trigger command if enabled
+              if (document.getElementById('camera-trigger').checked) {
+                  const triggerDistance = this.calculateTriggerDistance();
+                  if (triggerDistance > 0) {
+                      items.push({
+                          AMSLAltAboveTerrain: null,
+                          Altitude: altitude,
+                          AltitudeMode: altitudeMode,
+                          autoContinue: true,
+                          command: this.MAV_CMD.DO_SET_CAM_TRIGG_DIST,
+                          doJumpId: sequence++,
+                          frame: 2,
+                          params: [triggerDistance, 0, 1, 0, 0, 0, 0],
+                          type: "SimpleItem"
+                      });
+                  }
+              }
+              
+              // Add waypoint commands
+              this.waypoints.forEach((waypoint, index) => {
+                  if (isNaN(waypoint.lat) || isNaN(waypoint.lng) || isNaN(waypoint.alt)) {
+                      throw new Error(`Invalid waypoint coordinates at index ${index}`);
+                  }
+                  
+                  items.push({
+                      AMSLAltAboveTerrain: null,
+                      Altitude: waypoint.alt,
+                      AltitudeMode: altitudeMode,
+                      autoContinue: true,
+                      command: this.MAV_CMD.NAV_WAYPOINT,
+                      doJumpId: sequence++,
+                      frame: 3,
+                      params: [0, 0, 0, 0, waypoint.lat, waypoint.lng, waypoint.alt],
+                      type: "SimpleItem"
+                  });
+              });
+              
+              // Add RTL command
+              items.push({
+                  AMSLAltAboveTerrain: null,
+                  Altitude: 0,
+                  AltitudeMode: altitudeMode,
+                  autoContinue: true,
+                  command: this.MAV_CMD.NAV_RTL,
+                  doJumpId: sequence++,
+                  frame: 2,
+                  params: [0, 0, 0, 0, 0, 0, 0],
+                  type: "SimpleItem"
+              });
+              
+              return items;
+          }
+          
+          updatePlanPreview() {
+              const preview = document.getElementById('plan-preview');
+              if (this.currentPlan) {
+                  preview.textContent = JSON.stringify(this.currentPlan, null, 2);
+              } else {
+                  preview.textContent = 'No plan generated';
+              }
+          }
+          
+          updatePlanStatus(status) {
+              const statusElement = document.getElementById('plan-status');
+              let statusClass = 'status--info';
+              
+              switch (status) {
+                  case 'Valid':
+                      statusClass = 'status--success';
+                      break;
+                  case 'Error':
+                      statusClass = 'status--error';
+                      break;
+                  case 'Generating...':
+                      statusClass = 'status--warning';
+                      break;
+              }
+              
+              statusElement.innerHTML = `<span class="status ${statusClass}">${status}</span>`;
+          }
+          
+          enableExportButtons() {
+              const buttons = ['export-plan', 'export-json', 'export-csv'];
+              buttons.forEach(id => {
+                  document.getElementById(id).disabled = false;
+              });
+          }
+          
+          exportPlan() {
+              if (!this.currentPlan) {
+                  this.showError('No plan available to export');
+                  return;
+              }
+              
+              try {
+                  const blob = new Blob([JSON.stringify(this.currentPlan, null, 2)], {
+                      type: 'application/json'
+                  });
+                  this.downloadBlob(blob, 'mission.plan');
+              } catch (error) {
+                  this.showError('Failed to export plan: ' + error.message);
+              }
+          }
+          
+          exportJSON() {
+              if (!this.currentPlan) {
+                  this.showError('No plan available to export');
+                  return;
+              }
+              
+              try {
+                  const blob = new Blob([JSON.stringify(this.currentPlan, null, 2)], {
+                      type: 'application/json'
+                  });
+                  this.downloadBlob(blob, 'mission.json');
+              } catch (error) {
+                  this.showError('Failed to export JSON: ' + error.message);
+              }
+          }
+          
+          exportCSV() {
+              if (this.waypoints.length === 0) {
+                  this.showError('No waypoints available to export');
+                  return;
+              }
+              
+              try {
+                  const headers = ['ID', 'Latitude', 'Longitude', 'Altitude', 'Type'];
+                  const rows = this.waypoints.map(wp => [
+                      wp.id,
+                      wp.lat.toFixed(6),
+                      wp.lng.toFixed(6),
+                      wp.alt,
+                      wp.type
+                  ]);
+                  
+                  const csvContent = [headers, ...rows]
+                      .map(row => row.join(','))
+                      .join('\n');
+                  
+                  const blob = new Blob([csvContent], { type: 'text/csv' });
+                  this.downloadBlob(blob, 'waypoints.csv');
+              } catch (error) {
+                  this.showError('Failed to export CSV: ' + error.message);
+              }
+          }
+          
+          downloadBlob(blob, filename) {
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = filename;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+          }
+          
+          showLoading(show) {
+              const loading = document.getElementById('loading');
+              if (show) {
+                  loading.classList.remove('hidden');
+              } else {
+                  loading.classList.add('hidden');
+              }
+          }
+          
+          // Enhanced error handling
+          showError(message) {
+              console.error(message);
+              
+              // Remove any existing error toasts
+              const existingToasts = document.querySelectorAll('.error-toast');
+              existingToasts.forEach(toast => toast.remove());
+              
+              // Create new error toast
+              const toast = document.createElement('div');
+              toast.className = 'error-toast';
+              toast.textContent = message;
+              
+              document.body.appendChild(toast);
+              
+              // Auto remove after 5 seconds
+              setTimeout(() => {
+                  if (toast.parentNode) {
+                      toast.parentNode.removeChild(toast);
+                  }
+              }, 5000);
+              
+              // Allow manual close on click
+              toast.addEventListener('click', () => {
+                  if (toast.parentNode) {
+                      toast.parentNode.removeChild(toast);
+                  }
+              });
+          }
+          
+          // Utility functions (fixed implementations)
+          calculateDistance(lat1, lng1, lat2, lng2) {
+              const R = 6371000; // Earth's radius in meters
+              const dLat = this.toRadians(lat2 - lat1);
+              const dLng = this.toRadians(lng2 - lng1);
+              
+              const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                      Math.cos(this.toRadians(lat1)) * Math.cos(this.toRadians(lat2)) *
+                      Math.sin(dLng/2) * Math.sin(dLng/2);
+              const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+              
+              return R * c;
+          }
+          
+          toRadians(degrees) {
+              return degrees * (Math.PI / 180);
+          }
+          
+          // Fixed polygon area calculation
+          calculatePolygonArea(coordinates) {
+              if (!Array.isArray(coordinates) || coordinates.length < 3) {
+                  return 0;
+              }
+              
+              let area = 0;
+              const numPoints = coordinates.length - 1; // Exclude closing point
+              
+              // Use the shoelace formula for polygon area
+              for (let i = 0; i < numPoints; i++) {
+                  const j = (i + 1) % numPoints;
+                  area += coordinates[i][0] * coordinates[j][1];
+                  area -= coordinates[j][0] * coordinates[i][1];
+              }
+              
+              area = Math.abs(area) / 2.0;
+              
+              // Convert from square degrees to square meters
+              // Use approximate conversion at polygon centroid
+              const centroid = this.getPolygonCentroid(coordinates);
+              const metersPerDegreeLat = 111000;
+              const metersPerDegreeLng = 111000 * Math.cos(this.toRadians(centroid.lat));
+              
+              return area * metersPerDegreeLat * metersPerDegreeLng;
+          }
+          
+          getPolygonCentroid(coordinates) {
+              let lat = 0, lng = 0;
+              const numPoints = coordinates.length - 1; // Exclude closing point
+              
+              for (let i = 0; i < numPoints; i++) {
+                  lat += coordinates[i][1];
+                  lng += coordinates[i][0];
+              }
+              
+              return {
+                  lat: lat / numPoints,
+                  lng: lng / numPoints
+              };
+          }
+          
+          getPolygonBounds(coordinates) {
+              let minLat = Infinity, maxLat = -Infinity;
+              let minLng = Infinity, maxLng = -Infinity;
+              
+              coordinates.forEach(coord => {
+                  minLat = Math.min(minLat, coord[1]);
+                  maxLat = Math.max(maxLat, coord[1]);
+                  minLng = Math.min(minLng, coord[0]);
+                  maxLng = Math.max(maxLng, coord[0]);
+              });
+              
+              return { minLat, maxLat, minLng, maxLng };
+          }
+          
+          pointInPolygon(point, polygon) {
+              let inside = false;
+              const x = point[0], y = point[1];
+              
+              for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+                  const xi = polygon[i][0], yi = polygon[i][1];
+                  const xj = polygon[j][0], yj = polygon[j][1];
+                  
+                  if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+                      inside = !inside;
+                  }
+              }
+              
+              return inside;
+          }
+          
+          // Cleanup method
+          destroy() {
+              // Clear timeouts
+              if (this.debounceTimeout) {
+                  clearTimeout(this.debounceTimeout);
+              }
+              
+              // Clear map
+              if (this.map) {
+                  this.map.remove();
+              }
+              
+              // Remove event listeners (if needed for SPA)
+              // This would be implemented if the component needs to be destroyed
+          }
       }
-    });
-  }
 
-  getFeatureStyle(feature) {
-    const props = feature.get("properties") || {};
-
-    if (props.type === "boundary") {
-      return new ol.style.Style({
-        stroke: new ol.style.Stroke({
-          color: "#1FB8CD",
-          width: 2,
-        }),
-        fill: new ol.style.Fill({
-          color: "rgba(31, 184, 205, 0.2)",
-        }),
+      // Initialize the application when DOM is loaded
+      document.addEventListener('DOMContentLoaded', () => {
+          try {
+              window.qgcApp = new QGCPlanGenerator();
+              console.log('QGroundControl Plan Generator initialized successfully');
+          } catch (error) {
+              console.error('Failed to initialize QGroundControl Plan Generator:', error);
+              
+              // Show error message to user
+              const errorDiv = document.createElement('div');
+              errorDiv.className = 'error-toast';
+              errorDiv.textContent = 'Failed to initialize application: ' + error.message;
+              document.body.appendChild(errorDiv);
+          }
       });
-    } else if (props.type === "waypoint") {
-      return new ol.style.Style({
-        image: new ol.style.Circle({
-          radius: 12,
-          fill: new ol.style.Fill({
-            color: "#1FB8CD",
-          }),
-          stroke: new ol.style.Stroke({
-            color: "#ffffff",
-            width: 2,
-          }),
-        }),
-        text: new ol.style.Text({
-          text: props.id.toString(),
-          font: "12px sans-serif",
-          fill: new ol.style.Fill({
-            color: "#ffffff",
-          }),
-        }),
-      });
-    } else if (props.type === "home") {
-      return new ol.style.Style({
-        image: new ol.style.Circle({
-          radius: 16,
-          fill: new ol.style.Fill({
-            color: "#1FB8CD",
-          }),
-          stroke: new ol.style.Stroke({
-            color: "#ffffff",
-            width: 3,
-          }),
-        }),
-        text: new ol.style.Text({
-          text: "🏠",
-          font: "16px sans-serif",
-        }),
-      });
-    } else if (props.type === "path") {
-      return new ol.style.Style({
-        stroke: new ol.style.Stroke({
-          color: "#B4413C",
-          width: 2,
-          lineDash: [5, 5],
-        }),
-      });
-    }
-
-    return null;
-  }
-
-  setupEventListeners() {
-    // File upload handlers
-    this.setupFileUpload(
-      "geojson-upload",
-      "geojson-input",
-      this.handleGeoJSONFile.bind(this)
-    );
-
-    // Form change handlers - debounced for performance
-    const configInputs = [
-      "vehicle-type",
-      "firmware-type",
-      "default-altitude",
-      "cruise-speed",
-      "hover-speed",
-      "pattern-type",
-      "waypoint-spacing",
-      "altitude-mode",
-      "turn-around-distance",
-      "camera-trigger",
-      "grid-angle",
-      "overlap-percentage",
-    ];
-
-    configInputs.forEach((id) => {
-      const element = document.getElementById(id);
-      if (element) {
-        element.addEventListener(
-          "change",
-          this.debounce(this.onConfigChange.bind(this), 300)
-        );
-        if (element.type === "number" || element.type === "range") {
-          element.addEventListener(
-            "input",
-            this.debounce(this.onConfigChange.bind(this), 300)
-          );
-        }
-      }
-    });
-
-    document
-      .getElementById("pattern-type")
-      .addEventListener("change", (e) => {
-        const show = e.target.value === "survey";
-        document.getElementById("turn-waypoints-group").style.display = show
-          ? "block"
-          : "none";
-        this.onConfigChange();
-      });
-
-      document
-      .getElementById("turn-waypoints-only")
-      .addEventListener("change", (e) => {
-        this.keepTurnWaypoints = e.target.checked;
-        this.onConfigChange();
-      });
-    // Button handlers
-    document
-      .getElementById("generate-btn")
-      .addEventListener("click", this.generatePlan.bind(this));
-    document
-      .getElementById("reset-view")
-      .addEventListener("click", this.resetMapView.bind(this));
-    document
-      .getElementById("load-sample")
-      .addEventListener("click", this.loadSampleData.bind(this));
-    document
-      .getElementById("download-plan")
-      .addEventListener("click", this.downloadPlan.bind(this));
-    document
-      .getElementById("download-json")
-      .addEventListener("click", this.downloadJSON.bind(this));
-    document
-      .getElementById("export-csv")
-      .addEventListener("click", this.exportCSV.bind(this));
-  }
-
-  setupFileUpload(uploadAreaId, inputId, handler) {
-    const uploadArea = document.getElementById(uploadAreaId);
-    const input = document.getElementById(inputId);
-
-    uploadArea.addEventListener("click", () => input.click());
-
-    // Drag and drop handlers
-    uploadArea.addEventListener("dragover", (e) => {
-      e.preventDefault();
-      uploadArea.classList.add("drag-over");
-    });
-
-    uploadArea.addEventListener("dragleave", () => {
-      uploadArea.classList.remove("drag-over");
-    });
-
-    uploadArea.addEventListener("drop", (e) => {
-      e.preventDefault();
-      uploadArea.classList.remove("drag-over");
-      const files = e.dataTransfer.files;
-      if (files.length > 0) {
-        handler(files[0]);
-      }
-    });
-
-    input.addEventListener("change", (e) => {
-      if (e.target.files.length > 0) {
-        handler(e.target.files[0]);
-      }
-    });
-  }
-
-  async handleGeoJSONFile(file) {
-    const uploadArea = document.getElementById("geojson-upload");
-    const info = document.getElementById("geojson-info");
-
-    try {
-      // Validate file size (max 10MB)
-      if (file.size > 10 * 1024 * 1024) {
-        throw new Error("File too large (max 10MB)");
-      }
-
-      const text = await this.readFile(file);
-      const data = JSON.parse(text);
-
-      // Validate GeoJSON
-      if (!this.validateGeoJSON(data)) {
-        throw new Error("Invalid GeoJSON format or no polygon found");
-      }
-
-      this.geoJsonData = data;
-
-      // Update UI
-      uploadArea.classList.add("has-file");
-      this.showFileInfo(
-        info,
-        `${file.name} (${this.formatFileSize(file.size)})`,
-        "success"
-      );
-
-      // Display on map
-      this.displayBoundary();
-      this.enableGeneration();
-    } catch (error) {
-      this.showFileInfo(info, `Error: ${error.message}`, "error");
-      uploadArea.classList.remove("has-file");
-      console.error("GeoJSON file error:", error);
-    }
-  }
-
-  readFile(file) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = () => reject(new Error("Failed to read file"));
-      reader.readAsText(file);
-    });
-  }
-
-  validateGeoJSON(data) {
-    if (!data.type) return false;
-
-    if (data.type === "FeatureCollection") {
-      return (
-        data.features &&
-        data.features.some(
-          (feature) => feature.geometry && feature.geometry.type === "Polygon"
-        )
-      );
-    }
-
-    if (data.type === "Feature") {
-      return data.geometry && data.geometry.type === "Polygon";
-    }
-
-    if (data.type === "Polygon") {
-      return data.coordinates && data.coordinates.length > 0;
-    }
-
-    return false;
-  }
-
-  showFileInfo(element, message, type) {
-    element.textContent = message;
-    element.className = `file-info show ${type}`;
-  }
-
-  formatFileSize(bytes) {
-    if (bytes === 0) return "0 Bytes";
-    const k = 1024;
-    const sizes = ["Bytes", "KB", "MB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
-  }
-
-  displayBoundary() {
-    // Clear existing boundary
-    this.vectorSource.clear();
-
-    const polygon = this.extractPolygon();
-    if (!polygon) return;
-
-    // Convert to OpenLayers format
-    const coordinates = polygon.coordinates[0].map((coord) =>
-      ol.proj.fromLonLat(coord)
-    );
-    const olPolygon = new ol.geom.Polygon([coordinates]);
-
-    const feature = new ol.Feature({
-      geometry: olPolygon,
-      properties: { type: "boundary" },
-    });
-
-    this.vectorSource.addFeature(feature);
-    this.resetMapView();
-  }
-
-  extractPolygon() {
-    if (!this.geoJsonData) return null;
-
-    if (this.geoJsonData.type === "FeatureCollection") {
-      const polygonFeature = this.geoJsonData.features.find(
-        (f) => f.geometry && f.geometry.type === "Polygon"
-      );
-      return polygonFeature ? polygonFeature.geometry : null;
-    }
-
-    if (this.geoJsonData.type === "Feature") {
-      return this.geoJsonData.geometry;
-    }
-
-    if (this.geoJsonData.type === "Polygon") {
-      return this.geoJsonData;
-    }
-
-    return null;
-  }
-
-  resetMapView() {
-    if (this.vectorSource.getFeatures().length > 0) {
-      const extent = this.vectorSource.getExtent();
-      this.map.getView().fit(extent, {
-        padding: [50, 50, 50, 50],
-        duration: 500,
-      });
-    } else {
-      // Reset to default view
-      this.map.getView().setCenter(ol.proj.fromLonLat([0, 0]));
-      this.map.getView().setZoom(2);
-    }
-  }
-
-  enableGeneration() {
-    document.getElementById("generate-btn").disabled = false;
-  }
-
-  onConfigChange() {
-    // Real-time update when configuration changes
-    if (this.geoJsonData && this.waypoints.length > 0) {
-      // Don't auto-generate, just show notification
-      const status = document.getElementById("plan-status");
-      status.innerHTML =
-        '<div class="status status--warning">Configuration changed - click Generate to update plan</div>';
-    }
-  }
-
-  debounce(func, wait) {
-    let timeout;
-    return function executedFunction(...args) {
-      const later = () => {
-        clearTimeout(timeout);
-        func(...args);
-      };
-      clearTimeout(timeout);
-      timeout = setTimeout(later, wait);
-    };
-  }
-
-  async generatePlan() {
-    this.showLoading(true);
-
-    try {
-      // Small delay to allow UI to update
-      await this.delay(100);
-
-      // Generate waypoints
-      this.generateWaypoints();
-
-      // Create QGC plan
-      this.createQGCPlan();
-
-      // Update map
-      this.displayWaypoints();
-
-      // Update statistics
-      this.updateStatistics();
-
-      // Update UI
-      this.updatePlanPreview();
-      this.enableDownload();
-
-      // Update status
-      const status = document.getElementById("plan-status");
-      status.innerHTML =
-        '<div class="status status--success">Plan generated successfully</div>';
-    } catch (error) {
-      console.error("Plan generation error:", error);
-      const status = document.getElementById("plan-status");
-      status.innerHTML = `<div class="status status--error">Error: ${error.message}</div>`;
-    } finally {
-      this.showLoading(false);
-    }
-  }
-
-  generateWaypoints() {
-    const polygon = this.extractPolygon();
-    if (!polygon) throw new Error("No valid polygon found");
-
-    const pattern = document.getElementById("pattern-type").value;
-    const spacing = parseFloat(
-      document.getElementById("waypoint-spacing").value
-    );
-    const altitude = parseFloat(
-      document.getElementById("default-altitude").value
-    );
-    const gridAngle =
-      parseFloat(document.getElementById("grid-angle").value) || 0;
-
-    switch (pattern) {
-      case "survey":
-        this.waypoints = this.generateSurveyGrid(
-          polygon,
-          spacing,
-          altitude,
-          gridAngle
-        );
-        break;
-      case "perimeter":
-        this.waypoints = this.generatePerimeter(polygon, spacing, altitude);
-        break;
-      case "vertices":
-        this.waypoints = this.generateVertices(polygon, altitude);
-        break;
-      default:
-        throw new Error("Invalid pattern type");
-    }
-
-    if (this.waypoints.length === 0) {
-      throw new Error(
-        "No waypoints generated. Try reducing spacing or check polygon validity."
-      );
-    }
-  }
-
-  generateSurveyGrid(polygon, spacing, altitude, angle) {
-    const bounds = turf.bbox(polygon);
-    const [minLng, minLat, maxLng, maxLat] = bounds;
-
-    const waypoints = [];
-    let waypointId = 1;
-
-    // Calculate grid parameters
-    const latStep = spacing / 111000; // Rough conversion: 1 degree ≈ 111km
-    const lngStep =
-      spacing / (111000 * Math.cos((((minLat + maxLat) / 2) * Math.PI) / 180));
-
-    // Apply rotation if angle is specified
-    const centerLat = (minLat + maxLat) / 2;
-    const centerLng = (minLng + maxLng) / 2;
-    const angleRad = (angle * Math.PI) / 180;
-
-    // Generate grid points
-    let isEvenRow = true;
-    for (let lat = minLat; lat <= maxLat; lat += latStep) {
-      const row = [];
-      for (let lng = minLng; lng <= maxLng; lng += lngStep) {
-        let finalLat = lat;
-        let finalLng = lng;
-
-        // Apply rotation if needed
-        if (angle !== 0) {
-          const rotatedCoords = this.rotatePoint(
-            lng,
-            lat,
-            centerLng,
-            centerLat,
-            angleRad
-          );
-          finalLng = rotatedCoords[0];
-          finalLat = rotatedCoords[1];
-        }
-
-        const point = turf.point([finalLng, finalLat]);
-        if (turf.booleanPointInPolygon(point, polygon)) {
-          row.push({
-            id: waypointId++,
-            lat: finalLat,
-            lng: finalLng,
-            alt: altitude,
-          });
-        }
-      }
-
-      // Alternate direction for efficient flight path
-      if (!isEvenRow) {
-        row.reverse();
-      }
-
-      waypoints.push(...row);
-      isEvenRow = !isEvenRow;
-    }
-
-    return this.keepTurnWaypoints
-      ? this.filterTurnWaypoints(waypoints)
-      : waypoints;
-  }
-
-  filterTurnWaypoints(list) {
-    if (list.length <= 2) return list;
-
-    const keep = [list[0]];
-
-    for (let i = 1; i < list.length - 1; i++) {
-      const prev = list[i - 1];
-      const curr = list[i];
-      const next = list[i + 1];
-
-      // bearing from prev→curr and curr→next
-      const h1 = this.bearing(prev, curr);
-      const h2 = this.bearing(curr, next);
-
-      const delta = Math.abs(h1 - h2);
-      if (delta > 5 && delta < 355) keep.push(curr); // turning point
-    }
-    keep.push(list[list.length - 1]);
-    return keep;
-  }
-
-  // basic bearing (degrees) between two lat/lon points (flat enough for grids)
-  bearing(a, b) {
-    const toRad = (deg) => (deg * Math.PI) / 180;
-    const y = Math.sin(toRad(b.lng - a.lng)) * Math.cos(toRad(b.lat));
-    const x =
-      Math.cos(toRad(a.lat)) * Math.sin(toRad(b.lat)) -
-      Math.sin(toRad(a.lat)) *
-        Math.cos(toRad(b.lat)) *
-        Math.cos(toRad(b.lng - a.lng));
-    return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
-  }
-
-
-  rotatePoint(x, y, cx, cy, angle) {
-    const cos = Math.cos(angle);
-    const sin = Math.sin(angle);
-    const nx = cos * (x - cx) + sin * (y - cy) + cx;
-    const ny = cos * (y - cy) - sin * (x - cx) + cy;
-    return [nx, ny];
-  }
-
-  generatePerimeter(polygon, spacing, altitude) {
-    const coordinates = polygon.coordinates[0];
-    const waypoints = [];
-    let waypointId = 1;
-
-    // Create line string from polygon coordinates
-    const line = turf.lineString(coordinates);
-    const length = turf.length(line, { units: "meters" });
-
-    // Generate points along perimeter
-    const numPoints = Math.max(3, Math.floor(length / spacing));
-    const step = length / numPoints;
-
-    for (let i = 0; i < numPoints; i++) {
-      const distance = i * step;
-      const point = turf.along(line, distance / 1000, { units: "kilometers" });
-
-      waypoints.push({
-        id: waypointId++,
-        lat: point.geometry.coordinates[1],
-        lng: point.geometry.coordinates[0],
-        alt: altitude,
-      });
-    }
-
-    return waypoints;
-  }
-
-  generateVertices(polygon, altitude) {
-    const coordinates = polygon.coordinates[0];
-    const waypoints = [];
-
-    // Use polygon vertices (excluding the closing point)
-    for (let i = 0; i < coordinates.length - 1; i++) {
-      waypoints.push({
-        id: i + 1,
-        lat: coordinates[i][1],
-        lng: coordinates[i][0],
-        alt: altitude,
-      });
-    }
-
-    return waypoints;
-  }
-
-  createQGCPlan() {
-    const vehicleType = parseInt(document.getElementById("vehicle-type").value);
-    const firmwareType = parseInt(
-      document.getElementById("firmware-type").value
-    );
-    const cruiseSpeed = parseFloat(
-      document.getElementById("cruise-speed").value
-    );
-    const hoverSpeed = parseFloat(document.getElementById("hover-speed").value);
-    const altitudeMode = parseInt(
-      document.getElementById("altitude-mode").value
-    );
-
-    // Calculate home position (center of boundary)
-    const polygon = this.extractPolygon();
-    const centroid = turf.centroid(polygon);
-    const homePosition = [
-      centroid.geometry.coordinates[1], // lat
-      centroid.geometry.coordinates[0], // lng
-      parseFloat(document.getElementById("default-altitude").value), // alt
-    ];
-
-    // Create mission items
-    const items = [];
-
-    // Add takeoff command for copters
-    if (vehicleType === 2) {
-      // Copter
-      items.push({
-        AMSLAltAboveTerrain: null,
-        Altitude: homePosition[2],
-        AltitudeMode: altitudeMode,
-        autoContinue: true,
-        command: 22, // MAV_CMD_NAV_TAKEOFF
-        doJumpId: 1,
-        frame: 3,
-        params: [
-          15,
-          0,
-          0,
-          null,
-          homePosition[0],
-          homePosition[1],
-          homePosition[2],
-        ],
-        type: "SimpleItem",
-      });
-    }
-
-    // Add waypoint commands
-    this.waypoints.forEach((wp, index) => {
-      const params = [0, 0, 0, null, wp.lat, wp.lng, wp.alt];
-
-      // Add camera trigger if enabled
-      if (document.getElementById("camera-trigger").checked) {
-        params[6] = 1; // Camera trigger distance
-      }
-
-      items.push({
-        AMSLAltAboveTerrain: null,
-        Altitude: wp.alt,
-        AltitudeMode: altitudeMode,
-        autoContinue: true,
-        command: 16, // MAV_CMD_NAV_WAYPOINT
-        doJumpId: items.length + 1,
-        frame: 3,
-        params: params,
-        type: "SimpleItem",
-      });
-    });
-
-    // Add RTL command
-    items.push({
-      AMSLAltAboveTerrain: null,
-      Altitude: homePosition[2],
-      AltitudeMode: altitudeMode,
-      autoContinue: true,
-      command: 20, // MAV_CMD_NAV_RETURN_TO_LAUNCH
-      doJumpId: items.length + 1,
-      frame: 3,
-      params: [0, 0, 0, null, 0, 0, 0],
-      type: "SimpleItem",
-    });
-
-    // Create complete plan
-    this.currentPlan = {
-      fileType: "Plan",
-      geoFence: {
-        circles: [],
-        polygons: [],
-        version: 2,
-      },
-      groundStation: "QGroundControl",
-      mission: {
-        cruiseSpeed: cruiseSpeed,
-        firmwareType: firmwareType,
-        globalPlanAltitudeMode: altitudeMode,
-        hoverSpeed: hoverSpeed,
-        items: items,
-        plannedHomePosition: homePosition,
-        vehicleType: vehicleType,
-        version: 2,
-      },
-      rallyPoints: {
-        points: [],
-        version: 2,
-      },
-      version: 1,
-    };
-  }
-
-  displayWaypoints() {
-    // Clear existing waypoint and path features, keep boundary
-    const features = this.vectorSource.getFeatures();
-    const boundaryFeatures = features.filter(
-      (f) => f.get("properties")?.type === "boundary"
-    );
-    this.vectorSource.clear();
-    boundaryFeatures.forEach((f) => this.vectorSource.addFeature(f));
-
-    // Add home marker
-    if (this.currentPlan && this.currentPlan.mission.plannedHomePosition) {
-      const home = this.currentPlan.mission.plannedHomePosition;
-      const homeCoord = ol.proj.fromLonLat([home[1], home[0]]);
-
-      const homeFeature = new ol.Feature({
-        geometry: new ol.geom.Point(homeCoord),
-        properties: {
-          type: "home",
-          lat: home[0],
-          lng: home[1],
-          alt: home[2],
-        },
-      });
-
-      this.vectorSource.addFeature(homeFeature);
-    }
-
-    // Add waypoint markers
-    this.waypoints.forEach((wp) => {
-      const coord = ol.proj.fromLonLat([wp.lng, wp.lat]);
-
-      const feature = new ol.Feature({
-        geometry: new ol.geom.Point(coord),
-        properties: {
-          type: "waypoint",
-          id: wp.id,
-          lat: wp.lat,
-          lng: wp.lng,
-          alt: wp.alt,
-        },
-      });
-
-      this.vectorSource.addFeature(feature);
-    });
-
-    // Add flight path
-    if (this.waypoints.length > 1) {
-      const pathCoords = this.waypoints.map((wp) =>
-        ol.proj.fromLonLat([wp.lng, wp.lat])
-      );
-
-      const pathFeature = new ol.Feature({
-        geometry: new ol.geom.LineString(pathCoords),
-        properties: { type: "path" },
-      });
-
-      this.vectorSource.addFeature(pathFeature);
-    }
-  }
-
-  updateStatistics() {
-    const totalWaypoints = this.waypoints.length;
-    let totalDistance = 0;
-    let areaCoverage = 0;
-
-    // Calculate total distance
-    if (this.waypoints.length > 1) {
-      for (let i = 0; i < this.waypoints.length - 1; i++) {
-        const from = turf.point([this.waypoints[i].lng, this.waypoints[i].lat]);
-        const to = turf.point([
-          this.waypoints[i + 1].lng,
-          this.waypoints[i + 1].lat,
-        ]);
-        totalDistance += turf.distance(from, to, { units: "meters" });
-      }
-    }
-
-    // Calculate area coverage
-    if (this.geoJsonData) {
-      const polygon = this.extractPolygon();
-      if (polygon) {
-        areaCoverage = turf.area(polygon);
-      }
-    }
-
-    // Calculate estimated flight time
-    const cruiseSpeed = parseFloat(
-      document.getElementById("cruise-speed").value
-    );
-    const flightTime = totalDistance / cruiseSpeed / 60; // minutes
-
-    // Update UI
-    document.getElementById("total-waypoints").textContent = totalWaypoints;
-    document.getElementById("total-distance").textContent = `${Math.round(
-      totalDistance
-    )} m`;
-    document.getElementById("flight-time").textContent = `${Math.round(
-      flightTime
-    )} min`;
-    document.getElementById("area-coverage").textContent = `${Math.round(
-      areaCoverage
-    )} m²`;
-  }
-
-  updatePlanPreview() {
-    if (!this.currentPlan) return;
-
-    const jsonString = JSON.stringify(this.currentPlan, null, 2);
-    const codeElement = document.getElementById("plan-json");
-    codeElement.textContent = jsonString;
-
-    // Highlight syntax
-    if (window.Prism) {
-      Prism.highlightElement(codeElement);
-    }
-  }
-
-  enableDownload() {
-    document.getElementById("download-plan").disabled = false;
-    document.getElementById("download-json").disabled = false;
-    document.getElementById("export-csv").disabled = false;
-  }
-
-  downloadPlan() {
-    if (!this.currentPlan) return;
-
-    const jsonString = JSON.stringify(this.currentPlan, null, 2);
-    this.downloadFile(jsonString, "mission.plan", "application/json");
-  }
-
-  downloadJSON() {
-    if (!this.currentPlan) return;
-
-    const jsonString = JSON.stringify(this.currentPlan, null, 2);
-    this.downloadFile(jsonString, "mission.json", "application/json");
-  }
-
-  exportCSV() {
-    if (!this.waypoints.length) return;
-
-    let csv = "ID,Latitude,Longitude,Altitude,Type\n";
-
-    // Add home position
-    if (this.currentPlan && this.currentPlan.mission.plannedHomePosition) {
-      const home = this.currentPlan.mission.plannedHomePosition;
-      csv += `HOME,${home[0]},${home[1]},${home[2]},Home\n`;
-    }
-
-    // Add waypoints
-    this.waypoints.forEach((wp) => {
-      csv += `${wp.id},${wp.lat},${wp.lng},${wp.alt},Waypoint\n`;
-    });
-
-    this.downloadFile(csv, "waypoints.csv", "text/csv");
-  }
-
-  downloadFile(content, filename, contentType) {
-    const blob = new Blob([content], { type: contentType });
-    const url = URL.createObjectURL(blob);
-
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }
-
-  showLoading(show) {
-    const overlay = document.getElementById("loading-overlay");
-    if (overlay) {
-      if (show) {
-        overlay.classList.remove("hidden");
-      } else {
-        overlay.classList.add("hidden");
-      }
-    }
-  }
-
-  delay(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  loadSampleData() {
-    // Load sample GeoJSON data for demonstration
-    const sampleGeoJSON = {
-      type: "FeatureCollection",
-      features: [
-        {
-          type: "Feature",
-          properties: { name: "Sample Area" },
-          geometry: {
-            type: "Polygon",
-            coordinates: [
-              [
-                [-73.9857, 40.7484],
-                [-73.9837, 40.7484],
-                [-73.9837, 40.7464],
-                [-73.9857, 40.7464],
-                [-73.9857, 40.7484],
-              ],
-            ],
-          },
-        },
-      ],
-    };
-
-    this.geoJsonData = sampleGeoJSON;
-    this.displayBoundary();
-    this.enableGeneration();
-
-    // Update UI to show sample data loaded
-    const uploadArea = document.getElementById("geojson-upload");
-    const info = document.getElementById("geojson-info");
-    uploadArea.classList.add("has-file");
-    this.showFileInfo(info, "Sample data loaded (New York area)", "success");
-  }
-}
-
-// Initialize application when DOM is loaded
-document.addEventListener("readystatechange", () => {
-  if (document.readyState === "complete") {
-    try {
-      new QGCPlanGenerator();
-    } catch (error) {
-      console.error("Failed to initialize QGC Plan Generator:", error);
-      // Hide loading overlay in case of initialization error
-    } finally {
-      const overlay = document.getElementById("loading-overlay");
-      if (overlay) {
-        overlay.classList = 'hidden'
-      }
-    }
-  }
-});
