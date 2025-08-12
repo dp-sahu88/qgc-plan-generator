@@ -837,59 +837,70 @@
           }
           
           // Fixed camera trigger point generation
-          generateCameraTriggerPoints() {
-              if (this.waypoints.length < 2) return;
-              
-              const triggerDistance = this.calculateTriggerDistance();
-              if (triggerDistance <= 0) {
-                  console.warn('Invalid trigger distance calculated');
-                  return;
-              }
-              
-              this.cameraPoints = [];
-              let currentDistance = 0;
-              let triggerId = 1;
-              
-              // Add initial trigger point at first waypoint
-              this.cameraPoints.push({
-                  id: triggerId++,
-                  lat: this.waypoints[0].lat,
-                  lng: this.waypoints[0].lng,
-                  alt: this.waypoints[0].alt
-              });
-              
-              for (let i = 1; i < this.waypoints.length; i++) {
-                  const prev = this.waypoints[i - 1];
-                  const curr = this.waypoints[i];
-                  const segmentDistance = this.calculateDistance(prev.lat, prev.lng, curr.lat, curr.lng);
-                  
-                  let distanceAlongSegment = 0;
-                  
-                  while (currentDistance + triggerDistance <= segmentDistance) {
-                      currentDistance += triggerDistance;
-                      distanceAlongSegment = currentDistance;
-                      
-                      if (distanceAlongSegment <= segmentDistance) {
-                          const ratio = distanceAlongSegment / segmentDistance;
-                          
-                          const lat = prev.lat + (curr.lat - prev.lat) * ratio;
-                          const lng = prev.lng + (curr.lng - prev.lng) * ratio;
-                          
-                          this.cameraPoints.push({
-                              id: triggerId++,
-                              lat: lat,
-                              lng: lng,
-                              alt: curr.alt
-                          });
-                      }
-                  }
-                  
-                  currentDistance = segmentDistance - distanceAlongSegment;
-              }
-              
-              console.log(`Generated ${this.cameraPoints.length} camera trigger points`);
-              this.displayCameraTriggers();
-          }
+        generateCameraTriggerPoints() {
+            if (this.waypoints.length < 2) return;
+            
+            const triggerDistance = this.calculateTriggerDistance();
+            if (triggerDistance <= 0) {
+                console.warn('Invalid trigger distance calculated');
+                return;
+            }
+            
+            this.cameraPoints = [];
+            let triggerId = 1;
+
+            // At every waypoint, reset currentDistance, so triggers are always measured from there
+            for (let i = 1; i < this.waypoints.length; i++) {
+                const prev = this.waypoints[i - 1];
+                const curr = this.waypoints[i];
+                const segmentDistance = this.calculateDistance(prev.lat, prev.lng, curr.lat, curr.lng);
+
+                let distanceAlongSegment = 0;
+                let currentDistance = 0;
+                
+                // Add a camera trigger point at the waypoint itself (reset point)
+                this.cameraPoints.push({
+                    id: triggerId++,
+                    lat: prev.lat,
+                    lng: prev.lng,
+                    alt: prev.alt
+                });
+
+                // Place regular triggers measured from the start of this segment
+                while (currentDistance + triggerDistance <= segmentDistance) {
+                    currentDistance += triggerDistance;
+                    distanceAlongSegment = currentDistance;
+
+                    if (distanceAlongSegment <= segmentDistance) {
+                        const ratio = distanceAlongSegment / segmentDistance;
+
+                        const lat = prev.lat + (curr.lat - prev.lat) * ratio;
+                        const lng = prev.lng + (curr.lng - prev.lng) * ratio;
+
+                        this.cameraPoints.push({
+                            id: triggerId++,
+                            lat: lat,
+                            lng: lng,
+                            alt: curr.alt
+                        });
+                    }
+                }
+                // This ends at the last trigger before the next waypoint
+                // Next loop will start with the next waypoint, with trigger distance reset
+            }
+            // Optionally, add a trigger at the last waypoint
+            const last = this.waypoints[this.waypoints.length - 1];
+            this.cameraPoints.push({
+                id: triggerId++,
+                lat: last.lat,
+                lng: last.lng,
+                alt: last.alt
+            });
+
+            console.log(`Generated ${this.cameraPoints.length} camera trigger points (reset at each waypoint)`);
+            this.displayCameraTriggers();
+        }
+
           
           // Fixed trigger distance calculation
           calculateTriggerDistance() {
@@ -1159,7 +1170,8 @@
               // Validate required parameters
               const altitude = parseFloat(document.getElementById('altitude').value);
               const altitudeMode = parseInt(document.getElementById('altitude-mode').value);
-              
+              let triggerDistance;
+              const camEnabled = document.getElementById('camera-trigger').checked
               if (isNaN(altitude) || altitude <= 0) {
                   throw new Error('Invalid altitude value');
               }
@@ -1181,7 +1193,7 @@
               
               // Add camera trigger command if enabled
               if (document.getElementById('camera-trigger').checked) {
-                  const triggerDistance = this.calculateTriggerDistance();
+                  triggerDistance = this.calculateTriggerDistance();
                   if (triggerDistance > 0) {
                       items.push({
                           AMSLAltAboveTerrain: null,
@@ -1202,7 +1214,20 @@
                   if (isNaN(waypoint.lat) || isNaN(waypoint.lng) || isNaN(waypoint.alt)) {
                       throw new Error(`Invalid waypoint coordinates at index ${index}`);
                   }
-                  
+                  if (camEnabled) {
+                        // — Reset trigger distance to 0 at *arrival* to this waypoint
+                        items.push({
+                            AMSLAltAboveTerrain: null,
+                            Altitude: wp.alt,
+                            AltitudeMode: altitudeMode,
+                            autoContinue: true,
+                            command: this.MAV_CMD.DO_SET_CAM_TRIGG_DIST,
+                            doJumpId: sequence++,
+                            frame: 2,
+                            params: [0, 0, 1, 0, 0, 0, 0],
+                            type: "SimpleItem"
+                        });
+                    }
                   items.push({
                       AMSLAltAboveTerrain: null,
                       Altitude: waypoint.alt,
@@ -1214,6 +1239,20 @@
                       params: [0, 0, 0, 0, waypoint.lat, waypoint.lng, waypoint.alt],
                       type: "SimpleItem"
                   });
+                  if (camEnabled) {
+                        // — Re-enable trigger distance for the *next* line segment
+                        items.push({
+                            AMSLAltAboveTerrain: null,
+                            Altitude: wp.alt,
+                            AltitudeMode: altitudeMode,
+                            autoContinue: true,
+                            command: this.MAV_CMD.DO_SET_CAM_TRIGG_DIST,
+                            doJumpId: sequence++,
+                            frame: 2,
+                            params: [triggerDistance, 0, 1, 0, 0, 0, 0],
+                            type: "SimpleItem"
+                        });
+                    }
               });
               
               // Add RTL command
